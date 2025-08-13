@@ -1,0 +1,510 @@
+// ==UserScript==
+// @name         Provisionnés
+// @namespace    http://tampermonkey.net/
+// @version      1.3.0 // Feature: Menu integration instead of floating button.
+// @description  Upload CSV, map by EAN, inject Prov% + PV Plancher + Provisionnés restants (list & detail pages).
+// @match        https://dc.kfplc.com/*
+// @run-at       document-end
+// @grant        GM_addStyle
+// @grant        GM_setValue
+// @grant        GM_getValue
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  const LOG_PREFIX = '[ProvCSV]';
+  const STORAGE_KEY = 'provCsvDataV3';
+
+  GM_addStyle(`
+    /* --- Modal styles (remain dark for consistent overlay) --- */
+    #provcsv-overlay{position:fixed;inset:0;z-index:999998;display:none;background:rgba(15,16,20,.6);backdrop-filter:blur(3px)}
+    #provcsv-panel{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:min(640px,92vw);background:#0b1220;color:#e6edf3;border-radius:16px;box-shadow:0 20px 50px rgba(0,0,0,.45);border:1px solid rgba(124,147,255,.25);padding:18px}
+    #provcsv-panel h3{margin:0 0 12px 0;font:700 18px/1.2 system-ui,Segoe UI,Roboto,Arial}
+    #provcsv-panel p{margin:0 0 10px 0;color:#9aa4b2}
+    .provcsv-drop{margin-top:10px;border:2px dashed rgba(124,147,255,.35);border-radius:14px;padding:22px;text-align:center;transition:background .15s,border-color .15s}
+    .provcsv-drop.dragover{background:rgba(124,147,255,.08);border-color:rgba(124,147,255,.7)}
+    .provcsv-actions{display:flex;gap:10px;justify-content:space-between;align-items:center;margin-top:14px}
+    .provcsv-btn{background:#1e293b;border:1px solid rgba(124,147,255,.35);color:#e6edf3;border-radius:10px;padding:8px 12px;font:600 13px/1.2 system-ui,Segoe UI,Roboto,Arial;cursor:pointer}
+    .provcsv-btn.primary{background:#7c93ff;color:#0b1220;border-color:transparent}
+    .provcsv-meta{margin-top:8px;color:#9aa4b2;font-size:12px;white-space:pre-wrap;max-height:200px;overflow:auto}
+    .provcsv-badge{display:inline-block;padding:2px 6px;border-radius:6px;background:#ee3b3b;color:#fff;font:700 12px/1.2 system-ui,Segoe UI,Roboto,Arial;margin-top:4px;margin-right:6px}
+
+    /* --- Theme-Aware In-Page Styles --- */
+    .provcsv-small, .provcsv-inline, .provcsv-chip { transition: color .2s, background-color .2s, border-color .2s; }
+
+    /* Default (Dark Theme) */
+    .provcsv-small{display:block;margin-top:2px;color:#e6edf3;font:600 12px/1.3 system-ui,Segoe UI,Roboto,Arial;opacity:.95}
+    .provcsv-inline{display:inline-block;margin-left:8px;padding:2px 6px;border-radius:6px;background:#111826;border:1px solid rgba(124,147,255,.35);font:600 12px/1.2 system-ui,Segoe UI,Roboto,Arial;color:#e6edf3}
+    .provcsv-chip{display:inline-flex;align-items:center;padding:2px 6px;border-radius:999px;font:600 12px/1.1 system-ui,Segoe UI,Roboto,Arial;margin-right:8px;vertical-align:baseline;white-space:nowrap; border:1px solid rgba(124,147,255,.35);background:rgba(124,147,255,.08);color:#e6edf3;}
+    .provcsv-chip.warn{border-color:rgba(240,140,0,.45);background:rgba(240,140,0,.10)}
+    .provcsv-chip.bad{border-color:rgba(224,49,49,.45);background:rgba(224,49,49,.10)}
+
+    /* Light Theme Overrides (activated by .provcsv-light-theme on body) */
+    body.provcsv-light-theme .provcsv-small { color: #334155; opacity: 1; }
+    body.provcsv-light-theme .provcsv-inline { background: #e2e8f0; border-color: #cbd5e1; color: #1e293b; }
+    body.provcsv-light-theme .provcsv-chip { color: #1e293b; background: rgba(0,0,0,.05); border-color: rgba(0,0,0,.15); }
+    body.provcsv-light-theme .provcsv-chip.warn { color: #854d0e; background: #fefce8; border-color: #facc15; }
+    body.provcsv-light-theme .provcsv-chip.bad { color: #991b1b; background: #fee2e2; border-color: #fca5a5; }
+  `);
+
+  const nfEUR = new Intl.NumberFormat('fr-FR', { style: 'currency', currency: 'EUR', minimumFractionDigits: 2 });
+  const clean = (s) => String(s ?? '').trim();
+  const onlyDigits = (s) => clean(s).replace(/[^\d]/g, '');
+
+  const strip = (s) =>
+    clean(s)
+      .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+      .replace(/\u00A0/g, ' ')
+      .toLowerCase();
+
+  const normHeader = (s) =>
+    strip(s)
+      .replace(/[%€]/g, ' ')
+      .replace(/[^a-z0-9]+/g, ' ')
+      .replace(/\bref\b/g,'')
+      .replace(/\s+/g,' ')
+      .trim();
+
+  const toInt = (s) => {
+    const n = parseInt(String(s).replace(/[^\d-]/g, ''), 10);
+    return Number.isFinite(n) ? n : null;
+  };
+
+  const decommaFloat = (s) => {
+    if (s == null) return null;
+    const str = clean(String(s))
+      .replace(/[€%]/g, '')
+      .replace(/\s/g, '')
+      .replace(',', '.');
+    const val = parseFloat(str);
+    return Number.isFinite(val) ? val : null;
+  };
+
+  const calcProvisionnes = (stockJ1, qteSortir, currentStock) => {
+    if ([stockJ1, qteSortir, currentStock].some(v => typeof v !== 'number')) return null;
+    const target = stockJ1 - qteSortir;
+    return Math.max(0, currentStock - target);
+  };
+
+  async function readTextSmart(file) {
+    const buf = await file.arrayBuffer();
+    const utf8 = new TextDecoder('utf-8', { fatal: false }).decode(new Uint8Array(buf));
+    const badCount = (utf8.match(/\uFFFD/g) || []).length;
+    if (badCount > utf8.length / 80) {
+      const win = new TextDecoder('windows-1252', { fatal: false }).decode(new Uint8Array(buf));
+      return win;
+    }
+    return utf8;
+  }
+
+  function parseCSVAuto(text) {
+    if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+    const firstLine = text.split(/\r?\n/, 1)[0] || '';
+    const counts = {
+      ',': (firstLine.match(/,/g)  || []).length,
+      ';': (firstLine.match(/;/g)  || []).length,
+      '\t': (firstLine.match(/\t/g) || []).length,
+    };
+    const delim = Object.entries(counts).sort((a,b)=>b[1]-a[1])[0][0] || ',';
+    return parseCSV(text, delim);
+  }
+
+  function parseCSV(text, delim) {
+    const rows = [];
+    let i = 0, field = '', row = [], inQuotes = false;
+
+    while (i < text.length) {
+      const c = text[i];
+
+      if (inQuotes) {
+        if (c === '"') {
+          if (text[i + 1] === '"') { field += '"'; i++; } else { inQuotes = false; }
+        } else {
+          field += c;
+        }
+      } else {
+        if (c === '"') {
+          inQuotes = true;
+        } else if (c === delim) {
+          row.push(field); field = '';
+        } else if (c === '\n') {
+          row.push(field); rows.push(row); row = []; field = '';
+        } else if (c === '\r') {
+          // ignore
+        } else {
+          field += c;
+        }
+      }
+      i++;
+    }
+    row.push(field);
+    rows.push(row);
+    return rows.filter(r => r.some(cell => clean(cell) !== ''));
+  }
+
+  function mapHeaders(headerRow) {
+    const original = headerRow.map(h => clean(h));
+    const normalized = original.map(h => normHeader(h));
+    const tokensList = normalized.map(h => new Set(h.split(' ').filter(Boolean)));
+
+    const hasAny = (set, arr) => arr.some(a => set.has(a));
+
+    const map = {};
+
+    tokensList.forEach((tok, idx) => {
+      const h = normalized[idx];
+
+      if (!map[idx]) {
+        if (tok.has('ean') || tok.has('barcode') || (tok.has('code') && hasAny(tok, ['barre','barres','bar']))) {
+          map[idx] = 'ean'; return;
+        }
+      }
+      if (!map[idx]) {
+        const isQuantityTerm = hasAny(tok, ['qte','qt','quantite','qty']);
+        const hasStockTerm = tok.has('stock');
+        const isJ1Term = hasAny(tok, ['j','j1','j-1']) || tok.has('1') || /j ?-? ?1\b/.test(h) || /j ?moins ?1/.test(h);
+
+        if (isQuantityTerm && hasStockTerm && isJ1Term) {
+            map[idx] = 'stockJ1'; return;
+        }
+
+        if (!isQuantityTerm && hasStockTerm && tok.has('val') && isJ1Term) {
+            return;
+        }
+      }
+      if (!map[idx]) {
+        if ( (hasAny(tok, ['pv','prix']) && hasAny(tok, ['plancher'])) ) {
+          map[idx] = 'pvPlancher'; return;
+        }
+      }
+      if (!map[idx]) {
+        if ( (hasAny(tok, ['tx','taux']) && hasAny(tok, ['prov','provision','provisions'])) ) {
+          map[idx] = 'txProv'; return;
+        }
+      }
+      if (!map[idx]) {
+        const qtyish = hasAny(tok, ['qte','qt','quantite','qty']);
+        const sortish = Array.from(tok).some(t => t.startsWith('sort'));
+        if (qtyish && sortish) {
+          map[idx] = 'qteSortir'; return;
+        }
+      }
+    });
+
+    const got = Object.values(map);
+    const required = ['ean','stockJ1','pvPlancher','txProv','qteSortir'];
+    const missing = required.filter(k => !got.includes(k));
+
+    return { map, missing, originalHeaders: original, normalizedHeaders: normalized };
+  }
+
+  function buildData(rows) {
+    if (!rows.length) return { data:{}, headerInfo:null };
+    const hdr = rows[0];
+    const { map, missing, normalizedHeaders, originalHeaders } = mapHeaders(hdr);
+    if (missing.length) {
+      const debug = `En-tetes detectes:\n- Original: ${originalHeaders.join(' | ')}\n- Normalises: ${normalizedHeaders.join(' | ')}`;
+      throw new Error(`Colonnes manquantes: ${missing.join(', ')}\n\n${debug}`);
+    }
+    const data = {};
+    for (let r = 1; r < rows.length; r++) {
+      const row = rows[r];
+      const rec = {};
+      for (let c = 0; c < row.length; c++) {
+        const key = map[c];
+        if (!key) continue;
+        const val = row[c];
+        if (key === 'ean') rec.ean = onlyDigits(val);
+        else if (key === 'stockJ1') rec.stockJ1 = toInt(val);
+        else if (key === 'pvPlancher') rec.pvPlancher = decommaFloat(val);
+        else if (key === 'txProv') {
+          const v = decommaFloat(val);
+          rec.txProv = v != null && v < 1 && /[,\.]/.test(String(val)) ? v*100 : v;
+        } else if (key === 'qteSortir') rec.qteSortir = toInt(val);
+      }
+      if (rec.ean) data[rec.ean] = rec;
+    }
+    return { data, headerInfo: { map, originalHeaders, normalizedHeaders } };
+  }
+
+  // ---------- UI ----------
+  /**
+   * Creates the modal dialog for file upload, but does not display it.
+   * This function is idempotent and will only create the modal once.
+   */
+  function ensureModal() {
+    if (document.getElementById('provcsv-overlay')) return;
+
+    const ov = document.createElement('div');
+    ov.id = 'provcsv-overlay';
+    ov.innerHTML = `
+      <div id="provcsv-panel" role="dialog" aria-modal="true">
+        <h3>Charger le fichier CSV</h3>
+        <p>Colonnes requises: <strong>EAN</strong>, <strong>Qté Stock J-1</strong> (ou “J-”), <strong>PV plancher</strong>, <strong>TX Prov %</strong>, <strong>Qté à sortir</strong>.<br><em>Délimiteur: , ; ou tab. Encodage: UTF-8/Windows-1252.</em></p>
+        <div class="provcsv-drop" id="provcsv-drop">
+          <input type="file" id="provcsv-file" accept=".csv,text/csv,.tsv,text/tab-separated-values" style="display:none" />
+          <div>Glissez-déposez le fichier ici<br><span class="provcsv-meta">ou cliquez sur “Parcourir…”</span></div>
+          <div style="margin-top:10px"><button class="provcsv-btn" id="provcsv-browse">Parcourir…</button></div>
+        </div>
+        <div class="provcsv-actions">
+          <div class="provcsv-meta" id="provcsv-status"></div>
+          <div>
+            <button class="provcsv-btn" id="provcsv-cancel">Fermer</button>
+            <button class="provcsv-btn primary" id="provcsv-load">Charger</button>
+          </div>
+        </div>
+      </div>`;
+    document.body.appendChild(ov);
+
+    const drop   = ov.querySelector('#provcsv-drop');
+    const fileEl = ov.querySelector('#provcsv-file');
+    const browse = ov.querySelector('#provcsv-browse');
+    const cancel = ov.querySelector('#provcsv-cancel');
+    const load   = ov.querySelector('#provcsv-load');
+    const status = ov.querySelector('#provcsv-status');
+
+    let pendingFile = null;
+
+    function setStatus(msg) { status.textContent = msg || ''; }
+
+    ['dragenter','dragover'].forEach(evt =>
+      drop.addEventListener(evt, e => { e.preventDefault(); drop.classList.add('dragover'); })
+    );
+    ['dragleave','drop'].forEach(evt =>
+      drop.addEventListener(evt, e => { e.preventDefault(); drop.classList.remove('dragover'); })
+    );
+    drop.addEventListener('drop', e => {
+      const f = e.dataTransfer.files?.[0];
+      if (f) { pendingFile = f; setStatus(`Fichier prêt: ${f.name} (${Math.round(f.size/1024)} Ko)`); }
+    });
+
+    browse.addEventListener('click', () => fileEl.click());
+    fileEl.addEventListener('change', () => {
+      const f = fileEl.files?.[0];
+      if (f) { pendingFile = f; setStatus(`Fichier prêt: ${f.name} (${Math.round(f.size/1024)} Ko)`); }
+    });
+
+    cancel.addEventListener('click', closeOverlay);
+
+    load.addEventListener('click', async () => {
+      if (!pendingFile) { setStatus('Sélectionnez un fichier.'); return; }
+      try {
+        const text = await readTextSmart(pendingFile);
+        const rows = parseCSVAuto(text);
+        const { data, headerInfo } = buildData(rows);
+        await GM_setValue(STORAGE_KEY, data);
+        DATA = data;
+
+        const mappedPairs = Object.entries(headerInfo.map)
+          .map(([idx,k]) => `${headerInfo.originalHeaders[idx]}  →  ${k}`)
+          .join('\n');
+
+        setStatus(`Chargé: ${Object.keys(DATA).length} EAN(s).\n\nCorrespondances:\n${mappedPairs}`);
+        console.log(LOG_PREFIX, 'Data loaded', { count: Object.keys(DATA).length, headerInfo, sample: DATA[Object.keys(DATA)[0]] });
+        setTimeout(() => { closeOverlay(); applyEverywhere(); }, 300);
+      } catch (err) {
+        console.error(LOG_PREFIX, err);
+        setStatus(`Erreur: ${err.message || err}`);
+      }
+    });
+  }
+
+  /**
+   * Finds the site's main menu and injects a new link to open the CSV upload modal.
+   * This function is idempotent and safe to call multiple times.
+   */
+  function injectMenuButton() {
+      if (document.getElementById('provcsv-menu-btn')) return; // Already injected
+
+      // Find the "Pricer" menu item, which will be our anchor point.
+      const pricerLi = document.querySelector('a[data-auto="menu-link-pricer"]')?.parentElement;
+      if (!pricerLi) return; // Target not found, will try again on the next DOM mutation.
+
+      const newLi = document.createElement('li');
+      const newLink = document.createElement('a');
+      newLink.href = "#";
+      newLink.id = "provcsv-menu-btn";
+      newLink.className = "menu__nav-link";
+      newLink.textContent = "MAJ Provisionnés";
+      newLink.setAttribute('tabindex', '0');
+      newLink.setAttribute('data-auto', 'menu-link-provcsv'); // For consistency
+
+      newLink.addEventListener('click', (e) => {
+          e.preventDefault();
+          openOverlay();
+      });
+
+      newLi.appendChild(newLink);
+      // The site uses an empty comment node after links, let's replicate that.
+      newLi.appendChild(document.createComment(''));
+
+      pricerLi.insertAdjacentElement('afterend', newLi);
+      console.log(LOG_PREFIX, 'Menu item "MAJ Provisionnés" injected.');
+  }
+
+  function openOverlay() { const el = document.getElementById('provcsv-overlay'); if (el) el.style.display = 'block'; }
+  function closeOverlay() { const el = document.getElementById('provcsv-overlay'); if (el) el.style.display = 'none'; }
+
+  // ---------- Data ----------
+  let DATA = {};
+  async function loadData() { DATA = await GM_getValue(STORAGE_KEY, {}); if (!DATA || typeof DATA !== 'object') DATA = {}; }
+
+  // ---------- Injections ----------
+  const eur = (n) => (n != null ? nfEUR.format(n) : '—');
+
+  function getEffectiveBackgroundColor(el) {
+      let element = el;
+      while (element) {
+          const color = window.getComputedStyle(element).backgroundColor;
+          if (color && color !== 'rgba(0, 0, 0, 0)' && color !== 'transparent') {
+              return color;
+          }
+          element = element.parentElement;
+      }
+      return 'rgb(255, 255, 255)'; // Default to white if nothing is found
+  }
+
+  function detectAndSetTheme() {
+      const body = document.body;
+      const contentArea = document.querySelector('.container__body') || body;
+      if (!contentArea) return;
+
+      try {
+          const bgColor = getEffectiveBackgroundColor(contentArea);
+          const rgbMatch = bgColor.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+
+          body.classList.remove('provcsv-light-theme', 'provcsv-dark-theme');
+
+          if (rgbMatch) {
+              const r = parseInt(rgbMatch[1], 10);
+              const g = parseInt(rgbMatch[2], 10);
+              const b = parseInt(rgbMatch[3], 10);
+              if ((r + g + b) / 3 > 128) {
+                  body.classList.add('provcsv-light-theme');
+              } else {
+                  body.classList.add('provcsv-dark-theme');
+              }
+          } else {
+               body.classList.add('provcsv-dark-theme'); // Default to dark if parsing fails
+          }
+      } catch (e) {
+          console.error(LOG_PREFIX, "Theme detection failed, defaulting to dark.", e);
+          body.classList.add('provcsv-dark-theme');
+      }
+  }
+
+  function injectOnSearchList(root = document) {
+    const cards = root.querySelectorAll('ul.list-border li .prod-group');
+    if (!cards?.length) return;
+
+    cards.forEach(card => {
+      const eanEl = card.querySelector('[data-auto="product-ean"]');
+      const priceLi = card.querySelector('.prod-group__price, .price');
+      if (!eanEl || !priceLi) return;
+      const ean = onlyDigits(eanEl.textContent);
+      if (!ean || !DATA[ean]) return;
+
+      const rec = DATA[ean];
+      if (priceLi.querySelector('.provcsv-badge')) return;
+
+      const badge = document.createElement('div');
+      badge.className = 'provcsv-badge';
+      badge.textContent = `Prov. ${Math.round(rec.txProv ?? 0)}%`;
+
+      const info = document.createElement('div');
+      info.className = 'provcsv-small';
+      info.textContent = `PV Plancher: ${eur(rec.pvPlancher)}`;
+
+      priceLi.appendChild(badge);
+      priceLi.appendChild(info);
+    });
+  }
+
+  function injectOnProductDetail(doc = document) {
+    const m = location.pathname.match(/\/product-query\/(\d{8,14})$/);
+    if (!m) return;
+    const ean = m[1];
+    const rec = DATA[ean];
+    if (!rec) return;
+
+    const priceWrap = doc.querySelector('.prod-group__details .prod-group__price, .prod-price .prod-group__price, .prod-group__price');
+    if (priceWrap && !priceWrap.parentElement.querySelector('.provcsv-extraRow')) {
+      const extraRow = document.createElement('div');
+      extraRow.className = 'provcsv-extraRow';
+      extraRow.style.marginTop = '6px';
+
+      const pv = document.createElement('span');
+      pv.className = 'provcsv-inline';
+      pv.textContent = `PV Plancher: ${eur(rec.pvPlancher)}`;
+      extraRow.appendChild(pv);
+
+      const badge = document.createElement('span');
+      badge.style.marginLeft = '8px';
+      badge.className = 'provcsv-badge';
+      badge.textContent = `Prov. ${Math.round(rec.txProv ?? 0)}%`;
+      extraRow.appendChild(badge);
+
+      priceWrap.parentElement.insertBefore(extraRow, priceWrap.nextSibling);
+    }
+
+    const totalRow = Array.from(doc.querySelectorAll('table.table-styled tbody tr'))
+      .find(tr => /Total/i.test(tr.textContent || ''));
+    if (totalRow) {
+      const qtyTd = totalRow.querySelector('td.text-right');
+      let currentStock = null;
+      const qtyNumberEl = qtyTd ? (qtyTd.querySelector('span,strong') || qtyTd.firstChild) : null;
+      if (qtyNumberEl) currentStock = toInt(qtyNumberEl.textContent);
+
+      if (qtyTd && currentStock != null && !qtyTd.querySelector('.provcsv-chip')) {
+        const remain = calcProvisionnes(rec.stockJ1 ?? null, rec.qteSortir ?? null, currentStock);
+        if (remain != null) {
+          const pill = document.createElement('span');
+          pill.className = 'provcsv-chip' + (remain === 0 ? '' : remain <= 2 ? ' warn' : ' bad');
+          pill.title = `Stock J-1: ${rec.stockJ1 ?? '—'} | À sortir: ${rec.qteSortir ?? '—'}`;
+          pill.textContent = `${remain} provisionné${remain>1?'s':''} rest.`;
+          qtyTd.insertBefore(pill, qtyTd.firstChild);
+        }
+      }
+    }
+  }
+
+  // ---------- SPA observation ----------
+  let lastPath = location.pathname;
+  function applyEverywhere(root = document) {
+    // Attempt to inject the menu button on every significant DOM change.
+    // The function is idempotent and will only inject once or if the menu is re-rendered.
+    injectMenuButton();
+    detectAndSetTheme();
+
+    try {
+      const url = location.href;
+      if (/\/product-query\/search\//.test(url)) injectOnSearchList(root);
+      if (/\/product-query\/\d{8,14}$/.test(url)) injectOnProductDetail(root);
+    } catch (e) { console.error(LOG_PREFIX, 'applyEverywhere error', e); }
+  }
+
+  const observer = new MutationObserver(muts => {
+    const pathNow = location.pathname;
+    const significant = muts.some(m => m.addedNodes && m.addedNodes.length > 0);
+    if (pathNow !== lastPath) {
+      lastPath = pathNow;
+      setTimeout(() => applyEverywhere(document), 60);
+      return;
+    }
+    if (significant) {
+      if (observer._pending) return;
+      observer._pending = true;
+      setTimeout(() => { observer._pending = false; applyEverywhere(document); }, 80);
+    }
+  });
+
+  (async function boot() {
+    ensureModal(); // Creates the hidden modal panel on script start.
+    await loadData();
+    setTimeout(() => applyEverywhere(document), 120);
+    observer.observe(document.documentElement, { childList: true, subtree: true });
+    console.log(LOG_PREFIX, 'Ready. Loaded EANs:', Object.keys(DATA).length);
+  })();
+
+})();
