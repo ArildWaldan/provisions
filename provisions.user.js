@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Provisionnés
 // @namespace    http://tampermonkey.net/
-// @version      1.3.0 // Feature: Menu integration instead of floating button.
-// @description  Upload CSV, map by EAN, inject Prov% + PV Plancher + Provisionnés restants (list & detail pages).
+// @version      1.3.2 // Fix: provisionnés filter now hides non-matching list items (robust selectors + inline hide + re-apply)
+// @description  Upload CSV, map by EAN, inject Prov% + PV Plancher + Provisionnés restants (list & detail pages). Adds a filter to show only provisionnés in search results.
 // @match        https://dc.kfplc.com/*
 // @run-at       document-end
 // @grant        GM_addStyle
@@ -36,16 +36,19 @@
     /* Default (Dark Theme) */
     .provcsv-small{display:block;margin-top:2px;color:#e6edf3;font:600 12px/1.3 system-ui,Segoe UI,Roboto,Arial;opacity:.95}
     .provcsv-inline{display:inline-block;margin-left:8px;padding:2px 6px;border-radius:6px;background:#111826;border:1px solid rgba(124,147,255,.35);font:600 12px/1.2 system-ui,Segoe UI,Roboto,Arial;color:#e6edf3}
-    .provcsv-chip{display:inline-flex;align-items:center;padding:2px 6px;border-radius:999px;font:600 12px/1.1 system-ui,Segoe UI,Roboto,Arial;margin-right:8px;vertical-align:baseline;white-space:nowrap; border:1px solid rgba(124,147,255,.35);background:rgba(124,147,255,.08);color:#e6edf3;}
+    .provcsv-chip{display:inline-flex;align-items:center;padding:2px 6px;border-radius:999px;font:600 12px/1.1 system-ui,Segoe UI,Roboto,Arial;margin-right:8px;vertical-align:baseline;white-space:nowrap;border:1px solid rgba(124,147,255,.35);background:rgba(124,147,255,.08);color:#e6edf3;}
     .provcsv-chip.warn{border-color:rgba(240,140,0,.45);background:rgba(240,140,0,.10)}
     .provcsv-chip.bad{border-color:rgba(224,49,49,.45);background:rgba(224,49,49,.10)}
 
-    /* Light Theme Overrides (activated by .provcsv-light-theme on body) */
+    /* Light Theme Overrides */
     body.provcsv-light-theme .provcsv-small { color: #334155; opacity: 1; }
     body.provcsv-light-theme .provcsv-inline { background: #e2e8f0; border-color: #cbd5e1; color: #1e293b; }
     body.provcsv-light-theme .provcsv-chip { color: #1e293b; background: rgba(0,0,0,.05); border-color: rgba(0,0,0,.15); }
     body.provcsv-light-theme .provcsv-chip.warn { color: #854d0e; background: #fefce8; border-color: #facc15; }
     body.provcsv-light-theme .provcsv-chip.bad { color: #991b1b; background: #fee2e2; border-color: #fca5a5; }
+
+    /* Hide helper (still force inline too) */
+    .provcsv-hide{display:none!important}
   `);
 
   const nfEUR = new Intl.NumberFormat('fr-FR', { style: 'currency', currency: 'EUR', minimumFractionDigits: 2 });
@@ -73,10 +76,7 @@
 
   const decommaFloat = (s) => {
     if (s == null) return null;
-    const str = clean(String(s))
-      .replace(/[€%]/g, '')
-      .replace(/\s/g, '')
-      .replace(',', '.');
+    const str = clean(String(s)).replace(/[€%]/g,'').replace(/\s/g,'').replace(',', '.');
     const val = parseFloat(str);
     return Number.isFinite(val) ? val : null;
   };
@@ -101,11 +101,7 @@
   function parseCSVAuto(text) {
     if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
     const firstLine = text.split(/\r?\n/, 1)[0] || '';
-    const counts = {
-      ',': (firstLine.match(/,/g)  || []).length,
-      ';': (firstLine.match(/;/g)  || []).length,
-      '\t': (firstLine.match(/\t/g) || []).length,
-    };
+    const counts = { ',': (firstLine.match(/,/g)||[]).length, ';': (firstLine.match(/;/g)||[]).length, '\t': (firstLine.match(/\t/g)||[]).length };
     const delim = Object.entries(counts).sort((a,b)=>b[1]-a[1])[0][0] || ',';
     return parseCSV(text, delim);
   }
@@ -116,30 +112,18 @@
 
     while (i < text.length) {
       const c = text[i];
-
       if (inQuotes) {
-        if (c === '"') {
-          if (text[i + 1] === '"') { field += '"'; i++; } else { inQuotes = false; }
-        } else {
-          field += c;
-        }
+        if (c === '"') { if (text[i+1] === '"') { field += '"'; i++; } else { inQuotes = false; } }
+        else { field += c; }
       } else {
-        if (c === '"') {
-          inQuotes = true;
-        } else if (c === delim) {
-          row.push(field); field = '';
-        } else if (c === '\n') {
-          row.push(field); rows.push(row); row = []; field = '';
-        } else if (c === '\r') {
-          // ignore
-        } else {
-          field += c;
-        }
+        if (c === '"') inQuotes = true;
+        else if (c === delim) { row.push(field); field = ''; }
+        else if (c === '\n') { row.push(field); rows.push(row); row = []; field = ''; }
+        else if (c !== '\r') { field += c; }
       }
       i++;
     }
-    row.push(field);
-    rows.push(row);
+    row.push(field); rows.push(row);
     return rows.filter(r => r.some(cell => clean(cell) !== ''));
   }
 
@@ -147,48 +131,27 @@
     const original = headerRow.map(h => clean(h));
     const normalized = original.map(h => normHeader(h));
     const tokensList = normalized.map(h => new Set(h.split(' ').filter(Boolean)));
-
     const hasAny = (set, arr) => arr.some(a => set.has(a));
-
     const map = {};
 
     tokensList.forEach((tok, idx) => {
       const h = normalized[idx];
-
       if (!map[idx]) {
-        if (tok.has('ean') || tok.has('barcode') || (tok.has('code') && hasAny(tok, ['barre','barres','bar']))) {
-          map[idx] = 'ean'; return;
-        }
+        if (tok.has('ean') || tok.has('barcode') || (tok.has('code') && hasAny(tok, ['barre','barres','bar']))) { map[idx] = 'ean'; return; }
       }
       if (!map[idx]) {
         const isQuantityTerm = hasAny(tok, ['qte','qt','quantite','qty']);
         const hasStockTerm = tok.has('stock');
         const isJ1Term = hasAny(tok, ['j','j1','j-1']) || tok.has('1') || /j ?-? ?1\b/.test(h) || /j ?moins ?1/.test(h);
-
-        if (isQuantityTerm && hasStockTerm && isJ1Term) {
-            map[idx] = 'stockJ1'; return;
-        }
-
-        if (!isQuantityTerm && hasStockTerm && tok.has('val') && isJ1Term) {
-            return;
-        }
+        if (isQuantityTerm && hasStockTerm && isJ1Term) { map[idx] = 'stockJ1'; return; }
+        if (!isQuantityTerm && hasStockTerm && tok.has('val') && isJ1Term) { return; }
       }
-      if (!map[idx]) {
-        if ( (hasAny(tok, ['pv','prix']) && hasAny(tok, ['plancher'])) ) {
-          map[idx] = 'pvPlancher'; return;
-        }
-      }
-      if (!map[idx]) {
-        if ( (hasAny(tok, ['tx','taux']) && hasAny(tok, ['prov','provision','provisions'])) ) {
-          map[idx] = 'txProv'; return;
-        }
-      }
+      if (!map[idx]) { if ((hasAny(tok, ['pv','prix']) && hasAny(tok, ['plancher']))) { map[idx] = 'pvPlancher'; return; } }
+      if (!map[idx]) { if ((hasAny(tok, ['tx','taux']) && hasAny(tok, ['prov','provision','provisions']))) { map[idx] = 'txProv'; return; } }
       if (!map[idx]) {
         const qtyish = hasAny(tok, ['qte','qt','quantite','qty']);
         const sortish = Array.from(tok).some(t => t.startsWith('sort'));
-        if (qtyish && sortish) {
-          map[idx] = 'qteSortir'; return;
-        }
+        if (qtyish && sortish) { map[idx] = 'qteSortir'; return; }
       }
     });
 
@@ -209,19 +172,14 @@
     }
     const data = {};
     for (let r = 1; r < rows.length; r++) {
-      const row = rows[r];
-      const rec = {};
+      const row = rows[r]; const rec = {};
       for (let c = 0; c < row.length; c++) {
-        const key = map[c];
-        if (!key) continue;
-        const val = row[c];
+        const key = map[c]; if (!key) continue; const val = row[c];
         if (key === 'ean') rec.ean = onlyDigits(val);
         else if (key === 'stockJ1') rec.stockJ1 = toInt(val);
         else if (key === 'pvPlancher') rec.pvPlancher = decommaFloat(val);
-        else if (key === 'txProv') {
-          const v = decommaFloat(val);
-          rec.txProv = v != null && v < 1 && /[,\.]/.test(String(val)) ? v*100 : v;
-        } else if (key === 'qteSortir') rec.qteSortir = toInt(val);
+        else if (key === 'txProv') { const v = decommaFloat(val); rec.txProv = v != null && v < 1 && /[,\.]/.test(String(val)) ? v*100 : v; }
+        else if (key === 'qteSortir') rec.qteSortir = toInt(val);
       }
       if (rec.ean) data[rec.ean] = rec;
     }
@@ -229,13 +187,8 @@
   }
 
   // ---------- UI ----------
-  /**
-   * Creates the modal dialog for file upload, but does not display it.
-   * This function is idempotent and will only create the modal once.
-   */
   function ensureModal() {
     if (document.getElementById('provcsv-overlay')) return;
-
     const ov = document.createElement('div');
     ov.id = 'provcsv-overlay';
     ov.innerHTML = `
@@ -263,17 +216,12 @@
     const cancel = ov.querySelector('#provcsv-cancel');
     const load   = ov.querySelector('#provcsv-load');
     const status = ov.querySelector('#provcsv-status');
-
     let pendingFile = null;
 
     function setStatus(msg) { status.textContent = msg || ''; }
 
-    ['dragenter','dragover'].forEach(evt =>
-      drop.addEventListener(evt, e => { e.preventDefault(); drop.classList.add('dragover'); })
-    );
-    ['dragleave','drop'].forEach(evt =>
-      drop.addEventListener(evt, e => { e.preventDefault(); drop.classList.remove('dragover'); })
-    );
+    ['dragenter','dragover'].forEach(evt => drop.addEventListener(evt, e => { e.preventDefault(); drop.classList.add('dragover'); }));
+    ['dragleave','drop'].forEach(evt => drop.addEventListener(evt, e => { e.preventDefault(); drop.classList.remove('dragover'); }));
     drop.addEventListener('drop', e => {
       const f = e.dataTransfer.files?.[0];
       if (f) { pendingFile = f; setStatus(`Fichier prêt: ${f.name} (${Math.round(f.size/1024)} Ko)`); }
@@ -296,10 +244,7 @@
         await GM_setValue(STORAGE_KEY, data);
         DATA = data;
 
-        const mappedPairs = Object.entries(headerInfo.map)
-          .map(([idx,k]) => `${headerInfo.originalHeaders[idx]}  →  ${k}`)
-          .join('\n');
-
+        const mappedPairs = Object.entries(headerInfo.map).map(([idx,k]) => `${headerInfo.originalHeaders[idx]}  →  ${k}`).join('\n');
         setStatus(`Chargé: ${Object.keys(DATA).length} EAN(s).\n\nCorrespondances:\n${mappedPairs}`);
         console.log(LOG_PREFIX, 'Data loaded', { count: Object.keys(DATA).length, headerInfo, sample: DATA[Object.keys(DATA)[0]] });
         setTimeout(() => { closeOverlay(); applyEverywhere(); }, 300);
@@ -310,37 +255,23 @@
     });
   }
 
-  /**
-   * Finds the site's main menu and injects a new link to open the CSV upload modal.
-   * This function is idempotent and safe to call multiple times.
-   */
   function injectMenuButton() {
-      if (document.getElementById('provcsv-menu-btn')) return; // Already injected
-
-      // Find the "Pricer" menu item, which will be our anchor point.
-      const pricerLi = document.querySelector('a[data-auto="menu-link-pricer"]')?.parentElement;
-      if (!pricerLi) return; // Target not found, will try again on the next DOM mutation.
-
-      const newLi = document.createElement('li');
-      const newLink = document.createElement('a');
-      newLink.href = "#";
-      newLink.id = "provcsv-menu-btn";
-      newLink.className = "menu__nav-link";
-      newLink.textContent = "MAJ Provisionnés";
-      newLink.setAttribute('tabindex', '0');
-      newLink.setAttribute('data-auto', 'menu-link-provcsv'); // For consistency
-
-      newLink.addEventListener('click', (e) => {
-          e.preventDefault();
-          openOverlay();
-      });
-
-      newLi.appendChild(newLink);
-      // The site uses an empty comment node after links, let's replicate that.
-      newLi.appendChild(document.createComment(''));
-
-      pricerLi.insertAdjacentElement('afterend', newLi);
-      console.log(LOG_PREFIX, 'Menu item "MAJ Provisionnés" injected.');
+    if (document.getElementById('provcsv-menu-btn')) return;
+    const pricerLi = document.querySelector('a[data-auto="menu-link-pricer"]')?.parentElement;
+    if (!pricerLi) return;
+    const newLi = document.createElement('li');
+    const newLink = document.createElement('a');
+    newLink.href = "#";
+    newLink.id = "provcsv-menu-btn";
+    newLink.className = "menu__nav-link";
+    newLink.textContent = "MAJ Provisionnés";
+    newLink.setAttribute('tabindex', '0');
+    newLink.setAttribute('data-auto', 'menu-link-provcsv');
+    newLink.addEventListener('click', (e) => { e.preventDefault(); openOverlay(); });
+    newLi.appendChild(newLink);
+    newLi.appendChild(document.createComment(''));
+    pricerLi.insertAdjacentElement('afterend', newLi);
+    console.log(LOG_PREFIX, 'Menu item "MAJ Provisionnés" injected.');
   }
 
   function openOverlay() { const el = document.getElementById('provcsv-overlay'); if (el) el.style.display = 'block'; }
@@ -354,70 +285,51 @@
   const eur = (n) => (n != null ? nfEUR.format(n) : '—');
 
   function getEffectiveBackgroundColor(el) {
-      let element = el;
-      while (element) {
-          const color = window.getComputedStyle(element).backgroundColor;
-          if (color && color !== 'rgba(0, 0, 0, 0)' && color !== 'transparent') {
-              return color;
-          }
-          element = element.parentElement;
-      }
-      return 'rgb(255, 255, 255)'; // Default to white if nothing is found
+    let element = el;
+    while (element) {
+      const color = window.getComputedStyle(element).backgroundColor;
+      if (color && color !== 'rgba(0, 0, 0, 0)' && color !== 'transparent') return color;
+      element = element.parentElement;
+    }
+    return 'rgb(255, 255, 255)';
   }
 
   function detectAndSetTheme() {
-      const body = document.body;
-      const contentArea = document.querySelector('.container__body') || body;
-      if (!contentArea) return;
-
-      try {
-          const bgColor = getEffectiveBackgroundColor(contentArea);
-          const rgbMatch = bgColor.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
-
-          body.classList.remove('provcsv-light-theme', 'provcsv-dark-theme');
-
-          if (rgbMatch) {
-              const r = parseInt(rgbMatch[1], 10);
-              const g = parseInt(rgbMatch[2], 10);
-              const b = parseInt(rgbMatch[3], 10);
-              if ((r + g + b) / 3 > 128) {
-                  body.classList.add('provcsv-light-theme');
-              } else {
-                  body.classList.add('provcsv-dark-theme');
-              }
-          } else {
-               body.classList.add('provcsv-dark-theme'); // Default to dark if parsing fails
-          }
-      } catch (e) {
-          console.error(LOG_PREFIX, "Theme detection failed, defaulting to dark.", e);
-          body.classList.add('provcsv-dark-theme');
-      }
+    const body = document.body;
+    const contentArea = document.querySelector('.container__body') || body;
+    if (!contentArea) return;
+    try {
+      const bgColor = getEffectiveBackgroundColor(contentArea);
+      const rgbMatch = bgColor.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+      body.classList.remove('provcsv-light-theme', 'provcsv-dark-theme');
+      if (rgbMatch) {
+        const r = parseInt(rgbMatch[1], 10), g = parseInt(rgbMatch[2], 10), b = parseInt(rgbMatch[3], 10);
+        ((r+g+b)/3 > 128) ? body.classList.add('provcsv-light-theme') : body.classList.add('provcsv-dark-theme');
+      } else { body.classList.add('provcsv-dark-theme'); }
+    } catch (e) {
+      console.error(LOG_PREFIX, "Theme detection failed, defaulting to dark.", e);
+      body.classList.add('provcsv-dark-theme');
+    }
   }
 
   function injectOnSearchList(root = document) {
-    const cards = root.querySelectorAll('ul.list-border li .prod-group');
+    const cards = root.querySelectorAll('main.container__body ul.list-border li .prod-group');
     if (!cards?.length) return;
-
     cards.forEach(card => {
       const eanEl = card.querySelector('[data-auto="product-ean"]');
       const priceLi = card.querySelector('.prod-group__price, .price');
       if (!eanEl || !priceLi) return;
       const ean = onlyDigits(eanEl.textContent);
       if (!ean || !DATA[ean]) return;
-
       const rec = DATA[ean];
       if (priceLi.querySelector('.provcsv-badge')) return;
-
       const badge = document.createElement('div');
       badge.className = 'provcsv-badge';
       badge.textContent = `Prov. ${Math.round(rec.txProv ?? 0)}%`;
-
       const info = document.createElement('div');
       info.className = 'provcsv-small';
       info.textContent = `PV Plancher: ${eur(rec.pvPlancher)}`;
-
-      priceLi.appendChild(badge);
-      priceLi.appendChild(info);
+      priceLi.appendChild(badge); priceLi.appendChild(info);
     });
   }
 
@@ -433,18 +345,14 @@
       const extraRow = document.createElement('div');
       extraRow.className = 'provcsv-extraRow';
       extraRow.style.marginTop = '6px';
-
       const pv = document.createElement('span');
       pv.className = 'provcsv-inline';
       pv.textContent = `PV Plancher: ${eur(rec.pvPlancher)}`;
-      extraRow.appendChild(pv);
-
       const badge = document.createElement('span');
       badge.style.marginLeft = '8px';
       badge.className = 'provcsv-badge';
       badge.textContent = `Prov. ${Math.round(rec.txProv ?? 0)}%`;
-      extraRow.appendChild(badge);
-
+      extraRow.appendChild(pv); extraRow.appendChild(badge);
       priceWrap.parentElement.insertBefore(extraRow, priceWrap.nextSibling);
     }
 
@@ -469,17 +377,144 @@
     }
   }
 
+  // ---------- Provisionnés Filter (robust + inline hide) ----------
+  const FILTER_STORAGE_KEY = 'provCsvFilterProvOnlyV1';
+  let PROV_FILTER_ONLY = false;
+
+  async function loadFilterPref() {
+    try { PROV_FILTER_ONLY = !!(await GM_getValue(FILTER_STORAGE_KEY, false)); }
+    catch { PROV_FILTER_ONLY = false; }
+  }
+  async function setFilterPref(v) {
+    PROV_FILTER_ONLY = !!v;
+    try { await GM_setValue(FILTER_STORAGE_KEY, PROV_FILTER_ONLY); } catch {}
+  }
+
+  function isProvisionneByData(ean) {
+    const rec = DATA && DATA[ean];
+    if (!rec) return false;
+    if (rec.txProv == null) return true;
+    const n = Number(rec.txProv);
+    return Number.isFinite(n) ? n > 0 : true;
+  }
+
+  function getEANFromLi(li) {
+    // Prefer span text
+    const span = li.querySelector('[data-auto="product-ean"]');
+    const fromSpan = span ? onlyDigits(span.textContent) : '';
+    if (fromSpan) return fromSpan;
+    // Fallback: digits in href (/product-query/XXXXXXXXXXXX)
+    const a = li.querySelector('a[href^="/product-query/"]');
+    const m = a && a.getAttribute('href').match(/\/product-query\/(\d{8,14})/);
+    return m ? m[1] : '';
+  }
+
+  function toggleHide(node, hide) {
+    if (!node) return;
+    if (hide) {
+      node.classList.add('provcsv-hide');
+      node.setAttribute('hidden', '');
+      node.style.setProperty('display', 'none', 'important');
+      node.style.setProperty('visibility', 'hidden', 'important');
+    } else {
+      node.classList.remove('provcsv-hide');
+      node.removeAttribute('hidden');
+      node.style.removeProperty('display');
+      node.style.removeProperty('visibility');
+    }
+  }
+
+  function applyProvisionnesFilter(root = document) {
+    const list = root.querySelector('main.container__body ul.list-border');
+    if (!list) return;
+
+    // Unhide everything first if OFF
+    if (!PROV_FILTER_ONLY) {
+      list.querySelectorAll(':scope > li.provcsv-hide, :scope > li[hidden]').forEach(li => toggleHide(li, false));
+      return;
+    }
+    if (!DATA || !Object.keys(DATA).length) return; // No data => don't nuke the list.
+
+    const items = list.querySelectorAll(':scope > li');
+    let hidden = 0, kept = 0;
+    items.forEach(li => {
+      const ean = getEANFromLi(li);
+      const keep = ean && isProvisionneByData(ean);
+      toggleHide(li, !keep);
+      keep ? kept++ : hidden++;
+    });
+    // Optional debug
+    console.log(LOG_PREFIX, `Filter applied. kept=${kept} hidden=${hidden} (pref=${PROV_FILTER_ONLY})`);
+  }
+
+  function ensureProvisionnesMenuItem(context = document) {
+    const lists = Array.from(context.querySelectorAll('div[data-auto="vc-dropdown-list"].dropdown__list'));
+    if (!lists.length) return;
+
+    lists.forEach(list => {
+      const labels = Array.from(list.querySelectorAll('button[role="menuitem"]')).map(b => (b.textContent || '').trim());
+      const looksLikeResultFilter = labels.some(t => /en stock/i.test(t)) && labels.some(t => /en gamme/i.test(t));
+      if (!looksLikeResultFilter) return;
+
+      const existing = list.querySelector('#provcsv-filter-provisionnes');
+      if (existing) {
+        existing.setAttribute('aria-checked', String(PROV_FILTER_ONLY));
+        return;
+      }
+
+      const btn = document.createElement('button');
+      btn.id = 'provcsv-filter-provisionnes';
+      btn.type = 'button';
+      btn.className = 'dropdown__list-button';
+      btn.setAttribute('role', 'menuitem');
+      btn.setAttribute('tabindex', '-1');
+      btn.setAttribute('data-auto', 'vc-dropdown-list-button');
+      btn.setAttribute('aria-checked', String(PROV_FILTER_ONLY));
+      btn.textContent = ' Provisionnés ';
+
+      btn.addEventListener('click', async (e) => {
+        e.preventDefault();
+        await setFilterPref(!PROV_FILTER_ONLY);
+        document.querySelectorAll('#provcsv-filter-provisionnes')
+          .forEach(el => el.setAttribute('aria-checked', String(PROV_FILTER_ONLY)));
+        applyProvisionnesFilter(document);
+        // Re-apply after Vue reflows
+        setTimeout(() => applyProvisionnesFilter(document), 80);
+        setTimeout(() => applyProvisionnesFilter(document), 300);
+      });
+
+      list.appendChild(btn);
+    });
+  }
+
   // ---------- SPA observation ----------
   let lastPath = location.pathname;
+
   function applyEverywhere(root = document) {
-    // Attempt to inject the menu button on every significant DOM change.
-    // The function is idempotent and will only inject once or if the menu is re-rendered.
     injectMenuButton();
     detectAndSetTheme();
-
     try {
       const url = location.href;
-      if (/\/product-query\/search\//.test(url)) injectOnSearchList(root);
+      if (/\/product-query\/search\//.test(url)) {
+        injectOnSearchList(root);
+        ensureProvisionnesMenuItem(root);
+      }
+      // If results list exists, (re)apply filter regardless
+      if (root.querySelector('main.container__body ul.list-border')) {
+        applyProvisionnesFilter(root);
+        // Attach a one-time observer to the list to keep enforcing after virtualized updates
+        const list = root.querySelector('main.container__body ul.list-border');
+        if (list && !list._provcsvObserved) {
+          list._provcsvObserved = true;
+          const listObs = new MutationObserver(() => {
+            // Slight debounce
+            if (listObs._pending) return;
+            listObs._pending = true;
+            setTimeout(() => { listObs._pending = false; applyProvisionnesFilter(document); }, 60);
+          });
+          listObs.observe(list, { childList: true, subtree: false });
+        }
+      }
       if (/\/product-query\/\d{8,14}$/.test(url)) injectOnProductDetail(root);
     } catch (e) { console.error(LOG_PREFIX, 'applyEverywhere error', e); }
   }
@@ -500,11 +535,12 @@
   });
 
   (async function boot() {
-    ensureModal(); // Creates the hidden modal panel on script start.
+    ensureModal();
     await loadData();
+    await loadFilterPref();
     setTimeout(() => applyEverywhere(document), 120);
     observer.observe(document.documentElement, { childList: true, subtree: true });
-    console.log(LOG_PREFIX, 'Ready. Loaded EANs:', Object.keys(DATA).length);
+    console.log(LOG_PREFIX, 'Ready. Loaded EANs:', Object.keys(DATA).length, 'ProvOnly:', PROV_FILTER_ONLY);
   })();
 
 })();
