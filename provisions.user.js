@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Provisionnés
 // @namespace    http://tampermonkey.net/
-// @version      1.3.2 // Fix: provisionnés filter now hides non-matching list items (robust selectors + inline hide + re-apply)
+// @version      1.4.0 // UI overhaul: theme-aware modal, simplified UX, last import date, success toast
 // @description  Upload CSV, map by EAN, inject Prov% + PV Plancher + Provisionnés restants (list & detail pages). Adds a filter to show only provisionnés in search results.
 // @match        https://dc.kfplc.com/*
 // @run-at       document-end
@@ -15,20 +15,76 @@
 
   const LOG_PREFIX = '[ProvCSV]';
   const STORAGE_KEY = 'provCsvDataV3';
+  const LAST_IMPORT_KEY = 'provCsvLastImportV1';
 
   GM_addStyle(`
-    /* --- Modal styles (remain dark for consistent overlay) --- */
-    #provcsv-overlay{position:fixed;inset:0;z-index:999998;display:none;background:rgba(15,16,20,.6);backdrop-filter:blur(3px)}
-    #provcsv-panel{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:min(640px,92vw);background:#0b1220;color:#e6edf3;border-radius:16px;box-shadow:0 20px 50px rgba(0,0,0,.45);border:1px solid rgba(124,147,255,.25);padding:18px}
-    #provcsv-panel h3{margin:0 0 12px 0;font:700 18px/1.2 system-ui,Segoe UI,Roboto,Arial}
-    #provcsv-panel p{margin:0 0 10px 0;color:#9aa4b2}
-    .provcsv-drop{margin-top:10px;border:2px dashed rgba(124,147,255,.35);border-radius:14px;padding:22px;text-align:center;transition:background .15s,border-color .15s}
-    .provcsv-drop.dragover{background:rgba(124,147,255,.08);border-color:rgba(124,147,255,.7)}
-    .provcsv-actions{display:flex;gap:10px;justify-content:space-between;align-items:center;margin-top:14px}
-    .provcsv-btn{background:#1e293b;border:1px solid rgba(124,147,255,.35);color:#e6edf3;border-radius:10px;padding:8px 12px;font:600 13px/1.2 system-ui,Segoe UI,Roboto,Arial;cursor:pointer}
-    .provcsv-btn.primary{background:#7c93ff;color:#0b1220;border-color:transparent}
-    .provcsv-meta{margin-top:8px;color:#9aa4b2;font-size:12px;white-space:pre-wrap;max-height:200px;overflow:auto}
+    /* --- Modal Overlay --- */
+    #provcsv-overlay{position:fixed;inset:0;z-index:999998;display:none;backdrop-filter:blur(4px);transition:background .2s}
+
+    /* --- Modal Panel (Theme-Aware) --- */
+    #provcsv-panel{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:min(420px,90vw);border-radius:16px;box-shadow:0 25px 50px -12px rgba(0,0,0,.25);padding:24px;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;transition:background .2s,color .2s,border-color .2s}
+    #provcsv-panel h3{margin:0 0 6px 0;font-size:18px;font-weight:600;line-height:1.3}
+    #provcsv-panel .provcsv-subtitle{margin:0 0 20px 0;font-size:13px;opacity:.7}
+    #provcsv-panel .provcsv-last-import{display:flex;align-items:center;gap:8px;padding:12px 14px;border-radius:10px;margin-bottom:16px;font-size:13px}
+    #provcsv-panel .provcsv-last-import svg{flex-shrink:0}
+    #provcsv-panel .provcsv-last-import strong{font-weight:600}
+    .provcsv-drop{border:2px dashed;border-radius:12px;padding:28px 20px;text-align:center;transition:background .15s,border-color .15s}
+    .provcsv-drop.dragover{border-style:solid}
+    .provcsv-drop-icon{margin-bottom:12px}
+    .provcsv-drop-text{font-size:14px;font-weight:500;margin-bottom:4px}
+    .provcsv-drop-hint{font-size:12px;opacity:.6}
+    .provcsv-actions{display:flex;gap:10px;justify-content:flex-end;align-items:center;margin-top:20px}
+    .provcsv-btn{border:none;border-radius:8px;padding:10px 18px;font-size:14px;font-weight:500;cursor:pointer;transition:background .15s,transform .1s}
+    .provcsv-btn:hover{transform:translateY(-1px)}
+    .provcsv-btn:active{transform:translateY(0)}
+    .provcsv-file-info{display:none;align-items:center;gap:10px;padding:12px 14px;border-radius:10px;margin-top:12px;font-size:13px}
+    .provcsv-file-info.visible{display:flex}
+    .provcsv-file-info svg{flex-shrink:0}
+    .provcsv-file-info .provcsv-file-name{font-weight:500;word-break:break-all}
+    .provcsv-file-info .provcsv-file-clear{margin-left:auto;cursor:pointer;opacity:.6;transition:opacity .15s}
+    .provcsv-file-info .provcsv-file-clear:hover{opacity:1}
     .provcsv-badge{display:inline-block;padding:2px 6px;border-radius:6px;background:#ee3b3b;color:#fff;font:700 12px/1.2 system-ui,Segoe UI,Roboto,Arial;margin-top:4px;margin-right:6px}
+
+    /* --- Toast Notification --- */
+    #provcsv-toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(100px);z-index:999999;padding:14px 20px;border-radius:12px;font:500 14px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;display:flex;align-items:center;gap:10px;box-shadow:0 10px 40px rgba(0,0,0,.2);opacity:0;transition:transform .3s cubic-bezier(.4,0,.2,1),opacity .3s}
+    #provcsv-toast.show{transform:translateX(-50%) translateY(0);opacity:1}
+    #provcsv-toast svg{flex-shrink:0}
+
+    /* --- Dark Theme (Default) --- */
+    #provcsv-overlay{background:rgba(0,0,0,.5)}
+    #provcsv-panel{background:#1a1f2e;color:#e5e7eb;border:1px solid rgba(255,255,255,.1)}
+    #provcsv-panel .provcsv-last-import{background:rgba(99,102,241,.1);color:#a5b4fc}
+    #provcsv-panel .provcsv-last-import svg{color:#818cf8}
+    .provcsv-drop{border-color:rgba(255,255,255,.15);background:rgba(255,255,255,.02)}
+    .provcsv-drop.dragover{border-color:#6366f1;background:rgba(99,102,241,.1)}
+    .provcsv-drop-icon svg{color:#6b7280}
+    .provcsv-btn{background:rgba(255,255,255,.08);color:#e5e7eb}
+    .provcsv-btn:hover{background:rgba(255,255,255,.12)}
+    .provcsv-btn.primary{background:#6366f1;color:#fff}
+    .provcsv-btn.primary:hover{background:#4f46e5}
+    .provcsv-file-info{background:rgba(99,102,241,.1);color:#c7d2fe}
+    .provcsv-file-info svg{color:#818cf8}
+    #provcsv-toast{background:#1e293b;color:#e5e7eb;border:1px solid rgba(255,255,255,.1)}
+    #provcsv-toast.success{background:#065f46;border-color:#059669}
+    #provcsv-toast.success svg{color:#34d399}
+
+    /* --- Light Theme --- */
+    body.provcsv-light-theme #provcsv-overlay{background:rgba(0,0,0,.3)}
+    body.provcsv-light-theme #provcsv-panel{background:#ffffff;color:#1f2937;border:1px solid rgba(0,0,0,.1);box-shadow:0 25px 50px -12px rgba(0,0,0,.15)}
+    body.provcsv-light-theme #provcsv-panel .provcsv-last-import{background:#eef2ff;color:#4338ca}
+    body.provcsv-light-theme #provcsv-panel .provcsv-last-import svg{color:#6366f1}
+    body.provcsv-light-theme .provcsv-drop{border-color:#d1d5db;background:#f9fafb}
+    body.provcsv-light-theme .provcsv-drop.dragover{border-color:#6366f1;background:#eef2ff}
+    body.provcsv-light-theme .provcsv-drop-icon svg{color:#9ca3af}
+    body.provcsv-light-theme .provcsv-btn{background:#f3f4f6;color:#374151}
+    body.provcsv-light-theme .provcsv-btn:hover{background:#e5e7eb}
+    body.provcsv-light-theme .provcsv-btn.primary{background:#6366f1;color:#fff}
+    body.provcsv-light-theme .provcsv-btn.primary:hover{background:#4f46e5}
+    body.provcsv-light-theme .provcsv-file-info{background:#eef2ff;color:#3730a3}
+    body.provcsv-light-theme .provcsv-file-info svg{color:#6366f1}
+    body.provcsv-light-theme #provcsv-toast{background:#ffffff;color:#1f2937;border:1px solid rgba(0,0,0,.1)}
+    body.provcsv-light-theme #provcsv-toast.success{background:#ecfdf5;color:#065f46;border-color:#a7f3d0}
+    body.provcsv-light-theme #provcsv-toast.success svg{color:#10b981}
 
     /* --- Theme-Aware In-Page Styles --- */
     .provcsv-small, .provcsv-inline, .provcsv-chip { transition: color .2s, background-color .2s, border-color .2s; }
@@ -187,70 +243,178 @@
   }
 
   // ---------- UI ----------
+  const SVG_ICONS = {
+    upload: '<svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>',
+    file: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>',
+    calendar: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>',
+    check: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>',
+    x: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>'
+  };
+
+  function formatRelativeDate(dateStr) {
+    if (!dateStr) return null;
+    const date = new Date(dateStr);
+    if (isNaN(date.getTime())) return null;
+    const now = new Date();
+    const diffMs = now - date;
+    const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+    const timeStr = date.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+    if (diffDays === 0) return `Aujourd'hui à ${timeStr}`;
+    if (diffDays === 1) return `Hier à ${timeStr}`;
+    if (diffDays < 7) return `Il y a ${diffDays} jours`;
+    return date.toLocaleDateString('fr-FR', { day: 'numeric', month: 'short', year: 'numeric' });
+  }
+
+  async function getLastImportInfo() {
+    try {
+      const info = await GM_getValue(LAST_IMPORT_KEY, null);
+      return info;
+    } catch { return null; }
+  }
+
+  async function setLastImportInfo(count) {
+    const info = { date: new Date().toISOString(), count };
+    await GM_setValue(LAST_IMPORT_KEY, info);
+    return info;
+  }
+
+  function showToast(message, type = 'success') {
+    let toast = document.getElementById('provcsv-toast');
+    if (!toast) {
+      toast = document.createElement('div');
+      toast.id = 'provcsv-toast';
+      document.body.appendChild(toast);
+    }
+    toast.className = type;
+    toast.innerHTML = `${SVG_ICONS.check}<span>${message}</span>`;
+    requestAnimationFrame(() => {
+      toast.classList.add('show');
+      setTimeout(() => toast.classList.remove('show'), 3500);
+    });
+  }
+
   function ensureModal() {
     if (document.getElementById('provcsv-overlay')) return;
     const ov = document.createElement('div');
     ov.id = 'provcsv-overlay';
     ov.innerHTML = `
       <div id="provcsv-panel" role="dialog" aria-modal="true">
-        <h3>Charger le fichier CSV</h3>
-        <p>Colonnes requises: <strong>EAN</strong>, <strong>Qté Stock J-1</strong> (ou “J-”), <strong>PV plancher</strong>, <strong>TX Prov %</strong>, <strong>Qté à sortir</strong>.<br><em>Délimiteur: , ; ou tab. Encodage: UTF-8/Windows-1252.</em></p>
+        <h3>Importer les données</h3>
+        <p class="provcsv-subtitle">Fichier CSV des provisionnés</p>
+        <div class="provcsv-last-import" id="provcsv-last-import" style="display:none">
+          ${SVG_ICONS.calendar}
+          <span>Dernier import : <strong id="provcsv-last-date">—</strong> · <span id="provcsv-last-count">0</span> articles</span>
+        </div>
         <div class="provcsv-drop" id="provcsv-drop">
           <input type="file" id="provcsv-file" accept=".csv,text/csv,.tsv,text/tab-separated-values" style="display:none" />
-          <div>Glissez-déposez le fichier ici<br><span class="provcsv-meta">ou cliquez sur “Parcourir…”</span></div>
-          <div style="margin-top:10px"><button class="provcsv-btn" id="provcsv-browse">Parcourir…</button></div>
+          <div class="provcsv-drop-icon">${SVG_ICONS.upload}</div>
+          <div class="provcsv-drop-text">Glissez votre fichier ici</div>
+          <div class="provcsv-drop-hint">ou cliquez pour parcourir</div>
+        </div>
+        <div class="provcsv-file-info" id="provcsv-file-info">
+          ${SVG_ICONS.file}
+          <span class="provcsv-file-name" id="provcsv-file-name"></span>
+          <span class="provcsv-file-clear" id="provcsv-file-clear" title="Supprimer">${SVG_ICONS.x}</span>
         </div>
         <div class="provcsv-actions">
-          <div class="provcsv-meta" id="provcsv-status"></div>
-          <div>
-            <button class="provcsv-btn" id="provcsv-cancel">Fermer</button>
-            <button class="provcsv-btn primary" id="provcsv-load">Charger</button>
-          </div>
+          <button class="provcsv-btn" id="provcsv-cancel">Annuler</button>
+          <button class="provcsv-btn primary" id="provcsv-load">Importer</button>
         </div>
       </div>`;
     document.body.appendChild(ov);
 
-    const drop   = ov.querySelector('#provcsv-drop');
+    const drop = ov.querySelector('#provcsv-drop');
     const fileEl = ov.querySelector('#provcsv-file');
-    const browse = ov.querySelector('#provcsv-browse');
     const cancel = ov.querySelector('#provcsv-cancel');
-    const load   = ov.querySelector('#provcsv-load');
-    const status = ov.querySelector('#provcsv-status');
+    const load = ov.querySelector('#provcsv-load');
+    const fileInfo = ov.querySelector('#provcsv-file-info');
+    const fileName = ov.querySelector('#provcsv-file-name');
+    const fileClear = ov.querySelector('#provcsv-file-clear');
+    const lastImportEl = ov.querySelector('#provcsv-last-import');
+    const lastDateEl = ov.querySelector('#provcsv-last-date');
+    const lastCountEl = ov.querySelector('#provcsv-last-count');
     let pendingFile = null;
 
-    function setStatus(msg) { status.textContent = msg || ''; }
+    function setFile(f) {
+      pendingFile = f;
+      if (f) {
+        fileName.textContent = f.name;
+        fileInfo.classList.add('visible');
+      } else {
+        fileName.textContent = '';
+        fileInfo.classList.remove('visible');
+      }
+    }
 
-    ['dragenter','dragover'].forEach(evt => drop.addEventListener(evt, e => { e.preventDefault(); drop.classList.add('dragover'); }));
-    ['dragleave','drop'].forEach(evt => drop.addEventListener(evt, e => { e.preventDefault(); drop.classList.remove('dragover'); }));
+    async function updateLastImportDisplay() {
+      const info = await getLastImportInfo();
+      if (info && info.date) {
+        const formatted = formatRelativeDate(info.date);
+        if (formatted) {
+          lastDateEl.textContent = formatted;
+          lastCountEl.textContent = info.count?.toLocaleString('fr-FR') || '0';
+          lastImportEl.style.display = 'flex';
+          return;
+        }
+      }
+      lastImportEl.style.display = 'none';
+    }
+
+    // Update display when modal opens
+    ov.addEventListener('transitionend', updateLastImportDisplay);
+    updateLastImportDisplay();
+
+    ['dragenter', 'dragover'].forEach(evt => drop.addEventListener(evt, e => { e.preventDefault(); drop.classList.add('dragover'); }));
+    ['dragleave', 'drop'].forEach(evt => drop.addEventListener(evt, e => { e.preventDefault(); drop.classList.remove('dragover'); }));
+
     drop.addEventListener('drop', e => {
       const f = e.dataTransfer.files?.[0];
-      if (f) { pendingFile = f; setStatus(`Fichier prêt: ${f.name} (${Math.round(f.size/1024)} Ko)`); }
+      if (f) setFile(f);
     });
 
-    browse.addEventListener('click', () => fileEl.click());
+    drop.addEventListener('click', () => fileEl.click());
     fileEl.addEventListener('change', () => {
       const f = fileEl.files?.[0];
-      if (f) { pendingFile = f; setStatus(`Fichier prêt: ${f.name} (${Math.round(f.size/1024)} Ko)`); }
+      if (f) setFile(f);
+    });
+
+    fileClear.addEventListener('click', (e) => {
+      e.stopPropagation();
+      setFile(null);
+      fileEl.value = '';
     });
 
     cancel.addEventListener('click', closeOverlay);
+    ov.addEventListener('click', (e) => { if (e.target === ov) closeOverlay(); });
 
     load.addEventListener('click', async () => {
-      if (!pendingFile) { setStatus('Sélectionnez un fichier.'); return; }
+      if (!pendingFile) {
+        drop.style.borderColor = '#ef4444';
+        setTimeout(() => drop.style.borderColor = '', 1500);
+        return;
+      }
+      load.disabled = true;
+      load.textContent = 'Import…';
       try {
         const text = await readTextSmart(pendingFile);
         const rows = parseCSVAuto(text);
         const { data, headerInfo } = buildData(rows);
         await GM_setValue(STORAGE_KEY, data);
         DATA = data;
-
-        const mappedPairs = Object.entries(headerInfo.map).map(([idx,k]) => `${headerInfo.originalHeaders[idx]}  →  ${k}`).join('\n');
-        setStatus(`Chargé: ${Object.keys(DATA).length} EAN(s).\n\nCorrespondances:\n${mappedPairs}`);
-        console.log(LOG_PREFIX, 'Data loaded', { count: Object.keys(DATA).length, headerInfo, sample: DATA[Object.keys(DATA)[0]] });
-        setTimeout(() => { closeOverlay(); applyEverywhere(); }, 300);
+        const count = Object.keys(DATA).length;
+        await setLastImportInfo(count);
+        console.log(LOG_PREFIX, 'Data loaded', { count, headerInfo, sample: DATA[Object.keys(DATA)[0]] });
+        closeOverlay();
+        showToast(`${count.toLocaleString('fr-FR')} articles importés avec succès`);
+        applyEverywhere();
+        setFile(null);
+        fileEl.value = '';
       } catch (err) {
         console.error(LOG_PREFIX, err);
-        setStatus(`Erreur: ${err.message || err}`);
+        showToast(`Erreur: ${err.message || err}`, 'error');
+      } finally {
+        load.disabled = false;
+        load.textContent = 'Importer';
       }
     });
   }
@@ -274,7 +438,27 @@
     console.log(LOG_PREFIX, 'Menu item "MAJ Provisionnés" injected.');
   }
 
-  function openOverlay() { const el = document.getElementById('provcsv-overlay'); if (el) el.style.display = 'block'; }
+  function openOverlay() {
+    detectAndSetTheme();
+    const el = document.getElementById('provcsv-overlay');
+    if (el) {
+      el.style.display = 'block';
+      // Trigger last import update
+      getLastImportInfo().then(info => {
+        const lastImportEl = el.querySelector('#provcsv-last-import');
+        const lastDateEl = el.querySelector('#provcsv-last-date');
+        const lastCountEl = el.querySelector('#provcsv-last-count');
+        if (info && info.date && lastImportEl) {
+          const formatted = formatRelativeDate(info.date);
+          if (formatted) {
+            lastDateEl.textContent = formatted;
+            lastCountEl.textContent = info.count?.toLocaleString('fr-FR') || '0';
+            lastImportEl.style.display = 'flex';
+          }
+        }
+      });
+    }
+  }
   function closeOverlay() { const el = document.getElementById('provcsv-overlay'); if (el) el.style.display = 'none'; }
 
   // ---------- Data ----------
